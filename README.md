@@ -9,6 +9,7 @@ Message brokers hide a lot of machinery behind `publish` and `subscribe`. This r
 ## What's implemented
 
 - **Topic-based publish/subscribe with fan-out.** A `Broker` where subscribers register handlers against a topic and every publish fans out to all matching subscribers, with monotonic message ids, idempotent unsubscribe, and snapshot-consistent delivery (subscribing or unsubscribing during dispatch never changes who receives the in-flight message).
+- **Wildcard topic subscriptions.** AMQP-style pattern bindings where `*` matches exactly one segment and `#` matches zero or more, so one handler can receive a whole family of topics (`orders.#`, `*.created.us`). Matching uses a `#`-aware dynamic program, and a published message fans out to exact subscribers first, then every matching pattern.
 
 ## Usage
 
@@ -28,6 +29,19 @@ const delivered = broker.publish('orders.created', { orderId: 'A-1' })
 console.log(`${delivered} subscribers received it`) // 2
 
 off() // handler A stops receiving
+```
+
+Bind a handler to a family of topics with a pattern:
+
+```ts
+// `#` matches zero or more trailing segments
+broker.subscribePattern('orders.#', (msg) => {
+  console.log(`audit log saw ${msg.topic}`)
+})
+
+broker.publish('orders.created', { orderId: 'A-1' })     // matches
+broker.publish('orders.created.us', { orderId: 'A-2' })  // matches
+broker.publish('shipments.created', { orderId: 'B-1' })  // does not match
 ```
 
 ## Running the tests

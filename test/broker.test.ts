@@ -138,3 +138,66 @@ describe('delivery snapshot semantics', () => {
     expect(received).toEqual(['a', 'b:one', 'a'])
   })
 })
+
+describe('pattern subscriptions', () => {
+  it('delivers to a pattern subscriber whose pattern matches the topic', () => {
+    const broker = new Broker<string>()
+    const seen: string[] = []
+    broker.subscribePattern('orders.#', (m) => seen.push(m.topic))
+
+    expect(broker.publish('orders.created', 'a')).toBe(1)
+    expect(broker.publish('orders.created.us', 'b')).toBe(1)
+    expect(broker.publish('shipments.created', 'c')).toBe(0)
+
+    expect(seen).toEqual(['orders.created', 'orders.created.us'])
+  })
+
+  it('fans out to both exact and pattern subscribers, exact first', () => {
+    const broker = new Broker<string>()
+    const order: string[] = []
+    broker.subscribe('orders.created', () => order.push('exact'))
+    broker.subscribePattern('orders.*', () => order.push('pattern'))
+
+    expect(broker.publish('orders.created', 'x')).toBe(2)
+    expect(order).toEqual(['exact', 'pattern'])
+  })
+
+  it('invokes a handler once per matching pattern binding', () => {
+    const broker = new Broker<string>()
+    const seen: string[] = []
+    broker.subscribePattern('orders.*', () => seen.push('star'))
+    broker.subscribePattern('orders.#', () => seen.push('hash'))
+
+    expect(broker.publish('orders.created', 'x')).toBe(2)
+    expect(seen).toEqual(['star', 'hash'])
+  })
+
+  it('stops delivery after the pattern is unsubscribed', () => {
+    const broker = new Broker<string>()
+    const handler = vi.fn()
+    const off = broker.subscribePattern('orders.#', handler)
+
+    broker.publish('orders.created', 'a')
+    off()
+    broker.publish('orders.created', 'b')
+
+    expect(handler).toHaveBeenCalledOnce()
+  })
+
+  it('throws on an invalid pattern', () => {
+    const broker = new Broker<string>()
+    expect(() => broker.subscribePattern('', () => {})).toThrow(/invalid topic pattern/)
+    expect(() => broker.subscribePattern('orders..*', () => {})).toThrow()
+  })
+
+  it('does not consume a message id when nothing matches', () => {
+    const broker = new Broker<string>()
+    const ids: number[] = []
+    broker.subscribePattern('orders.#', (m) => ids.push(m.id))
+
+    broker.publish('shipments.created', 'skip') // no match, no id burned
+    broker.publish('orders.created', 'hit')
+
+    expect(ids).toEqual([1])
+  })
+})

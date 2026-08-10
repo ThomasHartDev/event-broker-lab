@@ -2,6 +2,11 @@ import { describe, it, expect } from 'vitest'
 import { WorkQueue, type Delivery } from '../src/index.js'
 
 describe('WorkQueue competing consumers', () => {
+  it('throws on invalid maxDeliveryCount', () => {
+    expect(() => new WorkQueue({ maxDeliveryCount: 0 })).toThrow(/maxDeliveryCount/)
+    expect(() => new WorkQueue({ maxDeliveryCount: 1.5 })).toThrow(/maxDeliveryCount/)
+  })
+
   it('delivers each message to exactly one consumer and round-robins', () => {
     const queue = new WorkQueue<string>()
     const a: string[] = []
@@ -175,6 +180,69 @@ describe('ack and nack', () => {
     })
     queue.enqueue('z')
     expect(tags).toEqual([1, 2, 3])
+  })
+
+  it('nack requeues to the tail when other messages are already ready', () => {
+    const queue = new WorkQueue<string>()
+    const order: string[] = []
+    let holdA: Delivery<string> | undefined
+    queue.consume((d) => {
+      if (d.message.payload === 'A' && !holdA) {
+        holdA = d
+        return
+      }
+      order.push(d.message.payload)
+      d.ack()
+    })
+    queue.enqueue('A')
+    expect(holdA).toBeDefined()
+    expect(queue.readyCount()).toBe(0)
+    queue.enqueue('B')
+    expect(queue.readyCount()).toBe(1)
+    holdA!.nack()
+    expect(order).toEqual(['B', 'A'])
+    expect(queue.readyCount()).toBe(0)
+    expect(queue.inFlightCount()).toBe(0)
+  })
+
+  it('always-nack does not hang: enqueue returns and deliveries stay bounded', () => {
+    const maxDeliveryCount = 5
+    const queue = new WorkQueue<string>({ maxDeliveryCount })
+    let deliveries = 0
+    queue.consume((d) => {
+      deliveries += 1
+      d.nack()
+    })
+    const id = queue.enqueue('spin')
+    expect(id).toBe(1)
+    expect(deliveries).toBe(maxDeliveryCount)
+    expect(queue.readyCount()).toBe(0)
+    expect(queue.inFlightCount()).toBe(0)
+    expect(queue.enqueue('still-responsive')).toBe(2)
+  })
+
+  it('always-throw / poison parse does not hang: bounded redelivery, enqueue returns', () => {
+    const maxDeliveryCount = 4
+    const queue = new WorkQueue<string>({ maxDeliveryCount })
+    let deliveries = 0
+    const seen: string[] = []
+    queue.consume((d) => {
+      deliveries += 1
+      seen.push(d.message.payload)
+      // Permanent poison: throw every time on this payload (e.g. bad JSON).
+      if (d.message.payload === 'not-json') {
+        JSON.parse(d.message.payload)
+      }
+      d.ack()
+    })
+    const id = queue.enqueue('not-json')
+    expect(id).toBe(1)
+    expect(deliveries).toBe(maxDeliveryCount)
+    expect(queue.readyCount()).toBe(0)
+    expect(queue.inFlightCount()).toBe(0)
+    expect(queue.enqueue('ok-after')).toBe(2)
+    expect(seen).toContain('ok-after')
+    expect(queue.inFlightCount()).toBe(0)
   })
 })
 

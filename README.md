@@ -14,13 +14,13 @@ Message brokers hide a lot of machinery behind `publish` and `subscribe`. This r
 - **Competing consumers** (work queue): each message is delivered to exactly one consumer
 - **Acknowledgements** (`ack` / `nack`) and **at-least-once** redelivery on nack or consumer cancel
 - **Prefetch** as a per-consumer in-flight limit for fair sharing
-- **Redelivery counting** and poison-message safe requeue (tail, not head)
+- **Redelivery counting**, **bounded redelivery** (`maxDeliveryCount`, default 10; excess drops), and **tail requeue** on nack so other ready work is not starved
 
 ## What's implemented
 
 - **Topic-based publish/subscribe with fan-out.** A `Broker` where subscribers register handlers against a topic and every publish fans out to all matching subscribers, with monotonic message ids, idempotent unsubscribe, and snapshot-consistent delivery (subscribing or unsubscribing during dispatch never changes who receives the in-flight message).
 - **Wildcard topic subscriptions.** AMQP-style pattern bindings where `*` matches exactly one segment and `#` matches zero or more, so one handler can receive a whole family of topics (`orders.#`, `*.created.us`). Matching uses a `#`-aware dynamic program, and a published message fans out to exact subscribers first, then every matching pattern.
-- **Competing-consumer work queue with acks.** A `WorkQueue` where each enqueued message goes to exactly one consumer. Consumers `ack` to settle or `nack` to requeue (or drop). Prefetch defaults to 1 so peers share fairly; cancelling a consumer requeues its unacked deliveries for the remaining workers.
+- **Competing-consumer work queue with acks.** A `WorkQueue` where each enqueued message goes to exactly one consumer. Consumers `ack` to settle or `nack` to requeue (or drop). Handler throw is treated as a requeueing nack. Prefetch defaults to 1 so peers share fairly; cancelling a consumer requeues its unacked deliveries at the head of ready. A nack requeues at the tail. Redelivery is bounded by `maxDeliveryCount` (default 10) so a permanent poison payload cannot busy-spin inside `enqueue`.
 
 ## Usage
 

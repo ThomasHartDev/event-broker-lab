@@ -6,5 +6,6 @@ export type {
   WorkMessage,
   Delivery,
   ConsumerHandler,
+  WorkQueueOptions,
   Unsubscribe as WorkQueueUnsubscribe,
 } from './work-queue.js'

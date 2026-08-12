@@ -195,7 +195,7 @@ describe('pattern subscriptions', () => {
     const ids: number[] = []
     broker.subscribePattern('orders.#', (m) => ids.push(m.id))
 
-    broker.publish('shipments.created', 'skip') // no match, no id burned
+    broker.publish('shipments.created', 'skip')
     broker.publish('orders.created', 'hit')
 
     expect(ids).toEqual([1])

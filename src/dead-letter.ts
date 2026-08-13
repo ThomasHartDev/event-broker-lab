@@ -42,8 +42,9 @@ export class DeadLetterQueue<T> {
   private readonly now: () => number
   private nextId = 1
   private readonly items = new Map<number, DeadLetterEnvelope<T>>()
-  private readonly byOriginal = new Map<number, number>()
-  private readonly attempts = new Map<number, number>()
+  private readonly byOriginal = new Map<string, number>()
+  private readonly attempts = new Map<string, number>()
+  private readonly ledgerOf = new Map<number, string>()
 
   constructor(options: DeadLetterQueueOptions = {}) {
     const maxAttempts = options.maxAttempts ?? 3
@@ -59,35 +60,38 @@ export class DeadLetterQueue<T> {
     this.now = options.now ?? Date.now
   }
 
-  fail(message: Delivery<T>, error: unknown): FailResult<T> {
-    const parked = this.parked(message.id)
+  fail(message: Delivery<T>, error: unknown, subscription?: string): FailResult<T> {
+    const parked = this.parked(message.id, subscription)
     if (parked) return { status: 'dead_lettered', attempts: parked.attempts, envelope: parked }
 
-    let attempts = this.attempts.get(message.id) ?? 0
+    const key = this.ledgerKey(message.id, subscription)
+    let attempts = this.attempts.get(key) ?? 0
     if (attempts < this.maxAttempts) {
       attempts += 1
-      this.attempts.set(message.id, attempts)
+      this.attempts.set(key, attempts)
       if (attempts < this.maxAttempts) return { status: 'retry', attempts }
     }
 
-    const envelope = this.enqueue(message, error, attempts)
+    const envelope = this.enqueue(message, error, attempts, key)
     return { status: 'dead_lettered', attempts, envelope }
   }
 
-  deadLetter(message: Delivery<T>, error: unknown): DeadLetterEnvelope<T> {
-    const parked = this.parked(message.id)
+  deadLetter(message: Delivery<T>, error: unknown, subscription?: string): DeadLetterEnvelope<T> {
+    const parked = this.parked(message.id, subscription)
     if (parked) return parked
-    const attempts = Math.max(this.attempts.get(message.id) ?? 0, 1)
-    this.attempts.set(message.id, attempts)
-    return this.enqueue(message, error, attempts)
+    const key = this.ledgerKey(message.id, subscription)
+    const attempts = Math.max(this.attempts.get(key) ?? 0, 1)
+    this.attempts.set(key, attempts)
+    return this.enqueue(message, error, attempts, key)
   }
 
-  succeed(originalId: number): void {
-    if (!this.byOriginal.has(originalId)) this.attempts.delete(originalId)
+  succeed(originalId: number, subscription?: string): void {
+    const key = this.ledgerKey(originalId, subscription)
+    if (!this.byOriginal.has(key)) this.attempts.delete(key)
   }
 
-  attemptCount(originalId: number): number {
-    return this.attempts.get(originalId) ?? 0
+  attemptCount(originalId: number, subscription?: string): number {
+    return this.attempts.get(this.ledgerKey(originalId, subscription)) ?? 0
   }
 
   peek(): readonly DeadLetterEnvelope<T>[] {
@@ -128,18 +132,30 @@ export class DeadLetterQueue<T> {
     return moved
   }
 
-  private parked(originalId: number): DeadLetterEnvelope<T> | undefined {
-    const id = this.byOriginal.get(originalId)
+  private ledgerKey(originalId: number, subscription?: string): string {
+    return `${subscription ?? ''}:${originalId}`
+  }
+
+  private parked(originalId: number, subscription?: string): DeadLetterEnvelope<T> | undefined {
+    const id = this.byOriginal.get(this.ledgerKey(originalId, subscription))
     return id === undefined ? undefined : this.items.get(id)
   }
 
   private forget(envelope: DeadLetterEnvelope<T>): void {
+    const key = this.ledgerOf.get(envelope.id)
     this.items.delete(envelope.id)
-    this.byOriginal.delete(envelope.originalId)
-    this.attempts.delete(envelope.originalId)
+    this.ledgerOf.delete(envelope.id)
+    if (key === undefined) return
+    this.byOriginal.delete(key)
+    this.attempts.delete(key)
   }
 
-  private enqueue(message: Delivery<T>, error: unknown, attempts: number): DeadLetterEnvelope<T> {
+  private enqueue(
+    message: Delivery<T>,
+    error: unknown,
+    attempts: number,
+    key: string,
+  ): DeadLetterEnvelope<T> {
     if (this.items.size >= this.capacity) throw new DeadLetterFullError(this.capacity)
     const envelope: DeadLetterEnvelope<T> = {
       id: this.nextId++,
@@ -151,20 +167,24 @@ export class DeadLetterQueue<T> {
       enqueuedAt: this.now(),
     }
     this.items.set(envelope.id, envelope)
-    this.byOriginal.set(message.id, envelope.id)
+    this.byOriginal.set(key, envelope.id)
+    this.ledgerOf.set(envelope.id, key)
     return envelope
   }
 }
 
+let nextWrapper = 1
+
 export function withDeadLetter<T>(dlq: DeadLetterQueue<T>, handler: Handler<T>): Handler<T> {
+  const subscription = `w${nextWrapper++}`
   return (message) => {
     for (;;) {
       try {
         handler(message)
-        dlq.succeed(message.id)
+        dlq.succeed(message.id, subscription)
         return
       } catch (error) {
-        if (dlq.fail(message, error).status === 'dead_lettered') return
+        if (dlq.fail(message, error, subscription).status === 'dead_lettered') return
       }
     }
   }

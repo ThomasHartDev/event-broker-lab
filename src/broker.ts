@@ -67,9 +67,15 @@ export class Broker<T> {
     if (snapshot.length === 0) return 0
 
     const message: Message<T> = { topic, payload, id: this.nextId++ }
+    let firstError: unknown
     for (const handler of snapshot) {
-      handler(message)
+      try {
+        handler(message)
+      } catch (error) {
+        if (firstError === undefined) firstError = error
+      }
     }
+    if (firstError !== undefined) throw firstError
     return snapshot.length
   }
 

@@ -56,6 +56,29 @@ describe('DeadLetterQueue.fail', () => {
     expect(parked.fail(msg(1), { code: 9 }).envelope?.error).toBe('[object Object]')
     expect(parked.fail(msg(2), 0).envelope?.error).toBe('0')
   })
+
+  it('does not share retry budget or parked envelopes across subscriptions', () => {
+    const dlq = new DeadLetterQueue<string>({ maxAttempts: 2, now: () => 7 })
+    expect(dlq.fail(msg(1), new Error('A'), 'left')).toEqual({ status: 'retry', attempts: 1 })
+    expect(dlq.fail(msg(1), new Error('B'), 'right')).toEqual({ status: 'retry', attempts: 1 })
+    const left = dlq.fail(msg(1), new Error('A'), 'left')
+    const right = dlq.fail(msg(1), new Error('B'), 'right')
+    expect(left).toMatchObject({
+      status: 'dead_lettered',
+      attempts: 2,
+      envelope: { originalId: 1, attempts: 2, error: 'A', enqueuedAt: 7 },
+    })
+    expect(right).toMatchObject({
+      status: 'dead_lettered',
+      attempts: 2,
+      envelope: { originalId: 1, attempts: 2, error: 'B', enqueuedAt: 7 },
+    })
+    expect(left.envelope).not.toBe(right.envelope)
+    expect(dlq.size()).toBe(2)
+    expect(dlq.attemptCount(1, 'left')).toBe(2)
+    expect(dlq.attemptCount(1, 'right')).toBe(2)
+    expect(dlq.attemptCount(1)).toBe(0)
+  })
 })
 
 describe('succeed and explicit deadLetter', () => {
@@ -127,6 +150,19 @@ describe('capacity, drop, purge, redrive', () => {
     expect(dlq.redrive(parked.id, (topic, payload) => seen.push([topic, payload]))).toEqual(parked)
     expect(seen).toEqual([['orders', 'job']])
     expect(dlq.redrive(parked.id, () => {})).toBeUndefined()
+  })
+
+  it('redriveAll replays every envelope when publish succeeds', () => {
+    const dlq = new DeadLetterQueue<string>({ maxAttempts: 1 })
+    dlq.fail(msg(1, 'a'), 'x')
+    dlq.fail(msg(2, 'b'), 'x')
+    const seen: string[] = []
+    expect(dlq.redriveAll((_topic, payload) => seen.push(payload)).map((e) => e.payload)).toEqual([
+      'a',
+      'b',
+    ])
+    expect(seen).toEqual(['a', 'b'])
+    expect(dlq.size()).toBe(0)
   })
 
   it('redriveAll walks insertion order and stops if a publish throws', () => {
@@ -208,6 +244,48 @@ describe('withDeadLetter', () => {
     dlq.redrive(dlq.peek()[0]!.id, (topic, payload) => broker.publish(topic, payload))
     expect(seen).toEqual(['A-1'])
     expect(dlq.size()).toBe(0)
+  })
+
+  it('counts retries and parks an envelope per wrapper on a shared queue', () => {
+    const broker = new Broker<string>()
+    const dlq = new DeadLetterQueue<string>({ maxAttempts: 3 })
+    const first = vi.fn(() => {
+      throw new Error('error A')
+    })
+    const second = vi.fn(() => {
+      throw new Error('error B')
+    })
+    broker.subscribe('orders', withDeadLetter(dlq, first))
+    broker.subscribe('orders', withDeadLetter(dlq, second))
+
+    expect(broker.publish('orders', 'poison')).toBe(2)
+    expect(first).toHaveBeenCalledTimes(3)
+    expect(second).toHaveBeenCalledTimes(3)
+    expect(dlq.size()).toBe(2)
+    expect(dlq.peek().map((e) => e.error).sort()).toEqual(['error A', 'error B'])
+    expect(dlq.peek().every((e) => e.originalId === 1 && e.attempts === 3)).toBe(true)
+  })
+
+  it('still delivers to a later subscriber when a full DLQ throws', () => {
+    const broker = new Broker<string>()
+    const dlq = new DeadLetterQueue<string>({ maxAttempts: 1, capacity: 1 })
+    const healthy = vi.fn()
+    broker.subscribe(
+      'orders',
+      withDeadLetter(dlq, () => {
+        throw new Error('poison')
+      }),
+    )
+    broker.subscribe('orders', healthy)
+
+    expect(broker.publish('orders', 'first')).toBe(2)
+    expect(dlq.peek()[0]?.payload).toBe('first')
+    expect(healthy).toHaveBeenCalledOnce()
+
+    expect(() => broker.publish('orders', 'second')).toThrow(DeadLetterFullError)
+    expect(healthy).toHaveBeenCalledTimes(2)
+    expect(healthy.mock.calls[1]?.[0]).toMatchObject({ payload: 'second' })
+    expect(dlq.peek()[0]?.payload).toBe('first')
   })
 
   it('surfaces DeadLetterFullError instead of parking a new poison payload', () => {

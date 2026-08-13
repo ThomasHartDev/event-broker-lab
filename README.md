@@ -12,7 +12,7 @@ Message brokers hide a lot of machinery behind `publish` and `subscribe`. This r
 - **Snapshot-consistent dispatch** (subscribe/unsubscribe mid-delivery does not change the in-flight recipient set)
 - **AMQP-style topic patterns** (`*` one segment, `#` zero or more) with a small dynamic program for matching
 - **Poison-message isolation** so one throwing subscriber does not abort the rest of a fan-out
-- **Redrive policy** (`maxAttempts`, SQS-style max receive count) that retries a delivery then gives up
+- **Redrive policy** (`maxAttempts`) that retries a failed handler immediately on the same publish, then gives up
 - **Dead-letter queue** that parks the original payload with source topic, attempt count, and last error
 - **Bounded failure queue** (explicit `capacity`) that refuses new entries instead of dropping evidence
 - **Redrive / replay** back onto the original topic, including a publish-then-remove so a failed replay leaves the envelope in place
@@ -21,7 +21,7 @@ Message brokers hide a lot of machinery behind `publish` and `subscribe`. This r
 
 - **Topic-based publish/subscribe with fan-out.** A `Broker` where subscribers register handlers against a topic and every publish fans out to all matching subscribers, with monotonic message ids, idempotent unsubscribe, and snapshot-consistent delivery (subscribing or unsubscribing during dispatch never changes who receives the in-flight message).
 - **Wildcard topic subscriptions.** AMQP-style pattern bindings where `*` matches exactly one segment and `#` matches zero or more, so one handler can receive a whole family of topics (`orders.#`, `*.created.us`). Matching uses a `#`-aware dynamic program, and a published message fans out to exact subscribers first, then every matching pattern.
-- **Dead-letter queue for poison messages.** A `DeadLetterQueue` plus `withDeadLetter` wrapper. Each failed delivery increments a per-message attempt ledger. After `maxAttempts` the payload is parked with its source topic, attempt count, and last error. Operators can inspect, `drop`, `purge`, or `redrive` back onto the original topic. A full DLQ throws `DeadLetterFullError` rather than silently discarding the poison payload.
+- **Dead-letter queue for poison messages.** A `DeadLetterQueue` plus `withDeadLetter` wrapper. Each failed delivery increments a per-subscription attempt ledger (two wrappers on one queue do not share retries or hide each other's last error). After `maxAttempts` the payload is parked with its source topic, attempt count, and last error. `Broker.publish` finishes the subscriber snapshot even if a handler throws, then rethrows the first error. Operators can inspect, `drop`, `purge`, or `redrive` back onto the original topic. A full DLQ throws `DeadLetterFullError` rather than silently discarding the poison payload.
 
 ## Usage
 
@@ -64,7 +64,7 @@ import { Broker, DeadLetterQueue, withDeadLetter } from 'event-broker-lab'
 const broker = new Broker<string>()
 const dlq = new DeadLetterQueue<string>({ maxAttempts: 3 })
 
-broker.subscribe(
+const off = broker.subscribe(
   'orders',
   withDeadLetter(dlq, (msg) => {
     if (msg.payload === 'poison') throw new Error('bad payload')
@@ -76,6 +76,7 @@ broker.publish('orders', 'poison')
 console.log(dlq.size()) // 1
 console.log(dlq.peek()[0]?.error) // bad payload
 
+off() // unsubscribe first, otherwise redrive hits the same handler and re-parks
 dlq.redriveAll((topic, payload) => {
   broker.publish(topic, payload)
 })

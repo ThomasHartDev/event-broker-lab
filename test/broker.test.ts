@@ -119,6 +119,19 @@ describe('delivery snapshot semantics', () => {
     expect(late).toHaveBeenCalledOnce()
   })
 
+  it('still delivers this message to later subscribers when an earlier handler throws', () => {
+    const broker = new Broker<string>()
+    const later = vi.fn()
+    broker.subscribe('t', () => {
+      throw new Error('unwrapped')
+    })
+    broker.subscribe('t', later)
+
+    expect(() => broker.publish('t', 'payload')).toThrow(/unwrapped/)
+    expect(later).toHaveBeenCalledOnce()
+    expect(later.mock.calls[0]?.[0]).toMatchObject({ topic: 't', payload: 'payload' })
+  })
+
   it('still delivers this message to a handler that unsubscribes a peer mid-dispatch', () => {
     const broker = new Broker<string>()
     const received: string[] = []

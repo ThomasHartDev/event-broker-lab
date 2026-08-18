@@ -266,7 +266,7 @@ export class WorkQueue<T> {
   }
 
   private applyFlow(): void {
-    if (!this.gate) return
+    if (this.pumping || !this.gate) return
     const next = this.gate.observe(this.ready.length)
     if (next === undefined) return
     this.emit({ state: next, occupancy: this.ready.length, capacity: this.capacity })

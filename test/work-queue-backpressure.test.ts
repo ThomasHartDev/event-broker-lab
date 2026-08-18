@@ -151,6 +151,32 @@ describe('WorkQueue backpressure signaling', () => {
     expect(queue.backpressure()).toBe('paused')
   })
 
+  it('surfaces a listener error when consume drains a paused queue with sync ack', () => {
+    const queue = new WorkQueue<string>({ capacity: 4, highWatermark: 3, lowWatermark: 1 })
+    queue.enqueue('1')
+    queue.enqueue('2')
+    queue.enqueue('3')
+    queue.enqueue('4')
+    expect(queue.backpressure()).toBe('paused')
+    expect(queue.readyCount()).toBe(4)
+
+    const delivered: string[] = []
+    queue.onBackpressure(() => {
+      throw new Error('listener-boom')
+    })
+
+    expect(() => {
+      queue.consume((d) => {
+        delivered.push(d.message.payload)
+        d.ack()
+      })
+    }).toThrow(/listener-boom/)
+
+    expect(delivered).toEqual(['1', '2', '3', '4'])
+    expect(queue.readyCount()).toBe(0)
+    expect(queue.backpressure()).toBe('open')
+  })
+
   it('does not reject a nack requeue when ready is already at capacity', () => {
     const queue = new WorkQueue<string>({ capacity: 1 })
     const events: string[] = []

@@ -1,20 +1,19 @@
-/**
- * Competing-consumer work queue with explicit acknowledgements.
- *
- * Unlike topic fan-out, each enqueued message is delivered to exactly one
- * consumer. Consumers ack on success or nack to requeue; unacked work held by
- * a leaving consumer is requeued so peers can take it (RabbitMQ / SQS model).
- *
- * Handler throw is treated as nack({ requeue: true }) so work is not stranded.
- * Redelivery is bounded by maxDeliveryCount (default 10); excess drops the
- * message (DLQ is future work). Each message id is delivered at most once per
- * pump round so a permanent nack/throw cannot busy-spin inside enqueue.
- */
+import {
+  QueueFullError,
+  WatermarkGate,
+  resolveQueueBounds,
+  type BackpressureEvent,
+  type BackpressureListener,
+  type FlowState,
+  type QueueBoundOptions,
+} from './backpressure.js'
+
+export { QueueFullError } from './backpressure.js'
+export type { BackpressureEvent, BackpressureListener, FlowState } from './backpressure.js'
 
 export interface WorkMessage<T> {
   readonly id: number
   readonly payload: T
-  /** Times this message has been handed to a consumer (1 on first delivery). */
   readonly deliveryCount: number
 }
 
@@ -22,19 +21,15 @@ export interface Delivery<T> {
   readonly message: WorkMessage<T>
   readonly deliveryTag: number
   ack(): void
-  /** Reject the delivery. `requeue` defaults to true. */
   nack(options?: { requeue?: boolean }): void
 }
 
 export type ConsumerHandler<T> = (delivery: Delivery<T>) => void
 export type Unsubscribe = () => void
 
-export interface WorkQueueOptions {
-  /**
-   * After this many deliveries, a requeueing nack/throw drops the message
-   * instead of putting it back on the ready queue. Must be a positive integer.
-   * Default 10.
-   */
+export type EnqueueResult = { readonly accepted: true; readonly id: number } | { readonly accepted: false }
+
+export interface WorkQueueOptions extends QueueBoundOptions {
   maxDeliveryCount?: number
 }
 
@@ -61,9 +56,14 @@ interface ConsumerState<T> {
 const DEFAULT_MAX_DELIVERY_COUNT = 10
 
 export class WorkQueue<T> {
+  readonly capacity: number
+  readonly highWatermark: number
+  readonly lowWatermark: number
   private readonly ready: PendingMessage<T>[] = []
   private readonly consumers: ConsumerState<T>[] = []
   private readonly inFlight = new Map<number, InFlightEntry<T>>()
+  private readonly listeners = new Set<BackpressureListener>()
+  private readonly gate: WatermarkGate | undefined
   private readonly maxDeliveryCount: number
   private nextMessageId = 1
   private nextDeliveryTag = 1
@@ -77,22 +77,45 @@ export class WorkQueue<T> {
       throw new Error(`maxDeliveryCount must be a positive integer, got ${max}`)
     }
     this.maxDeliveryCount = max
+    const bounds = resolveQueueBounds(options)
+    this.capacity = bounds.capacity
+    this.highWatermark = bounds.highWatermark
+    this.lowWatermark = bounds.lowWatermark
+    this.gate =
+      bounds.capacity === Number.POSITIVE_INFINITY
+        ? undefined
+        : new WatermarkGate(bounds.highWatermark, bounds.lowWatermark)
   }
 
-  /** Enqueue a payload. Dispatches if a consumer has spare capacity. Returns message id. */
   enqueue(payload: T): number {
+    const result = this.tryEnqueue(payload)
+    if (!result.accepted) throw new QueueFullError(this.capacity)
+    return result.id
+  }
+
+  tryEnqueue(payload: T): EnqueueResult {
+    if (this.ready.length >= this.capacity) return { accepted: false }
     const id = this.nextMessageId++
     this.ready.push({ id, payload, deliveryCount: 0 })
     this.pump()
-    return id
+    this.applyFlow()
+    return { accepted: true, id }
   }
 
-  /**
-   * Register a competing consumer. Default prefetch is 1. Unsubscribe requeues
-   * any still-unacked deliveries held by this consumer at the head of ready
-   * (prompt recovery). By contrast, nack({ requeue: true }) pushes to the tail
-   * so a poison message does not starve others already waiting.
-   */
+  backpressure(): FlowState {
+    return this.gate?.state ?? 'open'
+  }
+
+  onBackpressure(listener: BackpressureListener): Unsubscribe {
+    this.listeners.add(listener)
+    let active = true
+    return () => {
+      if (!active) return
+      active = false
+      this.listeners.delete(listener)
+    }
+  }
+
   consume(handler: ConsumerHandler<T>, options?: { prefetch?: number }): Unsubscribe {
     const prefetch = options?.prefetch ?? 1
     if (!Number.isInteger(prefetch) || prefetch < 1) {
@@ -108,6 +131,7 @@ export class WorkQueue<T> {
     }
     this.consumers.push(consumer)
     this.pump()
+    this.applyFlow()
 
     return () => {
       if (!consumer.active) return
@@ -126,6 +150,7 @@ export class WorkQueue<T> {
       const i = this.consumers.indexOf(consumer)
       if (i !== -1) this.consumers.splice(i, 1)
       this.pump()
+      this.applyFlow()
     }
   }
 
@@ -152,10 +177,7 @@ export class WorkQueue<T> {
     if (this.pumping) return
     this.pumping = true
     try {
-      // Cursor-based RR so sequential enqueues share fairly, not only batched pumps.
-      // Each message id is delivered at most once per round. A sync nack/throw that
-      // requeues cannot re-enter the same id inside that round (no busy-spin). A new
-      // round retries requeued work until idle or maxDeliveryCount drops it.
+      // Cursor RR. Same id at most once per round so a sync nack cannot busy-spin.
       while (this.ready.length > 0 && this.hasConsumerCapacity()) {
         const deliveredThisRound = new Set<number>()
         let deliveredAny = false
@@ -235,11 +257,31 @@ export class WorkQueue<T> {
     const consumer = this.consumers.find((c) => c.id === entry.consumerId)
     if (consumer?.active) consumer.inFlight -= 1
 
-    // Tail, not head: avoids a poison message starving others already on ready.
-    // Past maxDeliveryCount: drop (bounded redelivery; DLQ is future work).
+    // Tail, not head: a poison nack must not starve work already on ready.
     if (requeue && entry.pending.deliveryCount < this.maxDeliveryCount) {
       this.ready.push(entry.pending)
     }
     this.pump()
+    this.applyFlow()
+  }
+
+  private applyFlow(): void {
+    if (!this.gate) return
+    const next = this.gate.observe(this.ready.length)
+    if (next === undefined) return
+    this.emit({ state: next, occupancy: this.ready.length, capacity: this.capacity })
+  }
+
+  private emit(event: BackpressureEvent): void {
+    const snapshot = [...this.listeners]
+    let firstError: unknown
+    for (const listener of snapshot) {
+      try {
+        listener(event)
+      } catch (error) {
+        if (firstError === undefined) firstError = error
+      }
+    }
+    if (firstError !== undefined) throw firstError
   }
 }

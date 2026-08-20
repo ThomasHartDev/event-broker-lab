@@ -32,6 +32,9 @@ Message brokers hide a lot of machinery behind `publish` and `subscribe`. This r
 - **Time lag** as the age of the oldest unconsumed produce
 - **Sliding-window throughput** (circular time buckets) for produce and consume rates, so a quiet period after a burst reports ~0
 
+- **Partitioned log** with **key-based partitioning** (FNV-1a) so a key is sticky to one partition
+- **Consumer groups** with **range** and **round-robin partition assignment**, **eager rebalance** on join/leave, and **group-level committed offsets**
+- **Per-key ordering**: records for one key append in order on one partition, and only the assigned member reads them
 ## What's implemented
 
 - **Topic-based publish/subscribe with fan-out.** A `Broker` where subscribers register handlers against a topic and every publish fans out to all matching subscribers, with monotonic message ids, idempotent unsubscribe, and snapshot-consistent delivery (subscribing or unsubscribing during dispatch never changes who receives the in-flight message).
@@ -55,6 +58,13 @@ Message brokers hide a lot of machinery behind `publish` and `subscribe`. This r
 - **Time lag** as the age of the oldest unconsumed produce
 - **Sliding-window throughput** (circular time buckets) for produce and consume rates, so a quiet period after a burst reports ~0
 - **Throughput and lag metrics per topic.** `TopicMetrics` records `produced` / `consumed` per topic. Lag is `logEndOffset - committedOffset` (Kafka's formula), time lag is the age of the oldest unconsumed record, and produce/consume rates use a sliding window of circular time buckets. Two consumers on one topic keep independent commits and rates.
+- **Partitioned log** with **key-based partitioning** (FNV-1a) so a key is sticky to one partition
+- **Consumer groups** with **range** and **round-robin partition assignment**, **eager rebalance** on join/leave, and **group-level committed offsets**
+- **Per-key ordering**: records for one key append in order on one partition, and only the assigned member reads them
+- **Partitioned log** with **key-based partitioning** (FNV-1a) so a key is sticky to one partition
+- **Consumer groups** with **range** and **round-robin partition assignment**, **eager rebalance** on join/leave, and **group-level committed offsets**
+- **Per-key ordering**: records for one key append in order on one partition, and only the assigned member reads them
+- **Consumer groups with partition assignment.** A `PartitionedTopic` is an append-only log split into N partitions. `produce(key, payload)` hashes the key with FNV-1a so that key always lands on the same partition. A `ConsumerGroup` assigns each partition to at most one member using Kafka's range assignor (consecutive slices, remainder on the first members) or round-robin (interleaved). Independent groups each see the full log. Offsets are stored on the group, so a rebalance hands a partition to a peer at the last committed offset instead of replaying from zero. A thrown handler stalls that partition until the next pump.
 ## Usage
 
 ```ts

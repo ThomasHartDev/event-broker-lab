@@ -76,3 +76,18 @@ export type {
   TopicSnapshot,
   TopicMetricsOptions,
 } from './metrics.js'
+
+export {
+  PartitionedTopic,
+  ConsumerGroup,
+  partitionForKey,
+  rangeAssign,
+  roundRobinAssign,
+} from './consumer-group.js'
+
+export type {
+  AssignmentStrategy,
+  LogRecord,
+  RecordHandler,
+  GroupMember,
+} from './consumer-group.js'

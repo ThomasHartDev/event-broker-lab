@@ -14,6 +14,12 @@ describe('partitionForKey', () => {
     expect(() => partitionForKey('k', 1.5)).toThrow(/partitionCount/)
   })
 
+  it('matches the FNV-1a 32-bit golden vectors', () => {
+    const fnvMod = 0x1_0000_0000
+    expect(partitionForKey('', fnvMod)).toBe(0x811c9dc5)
+    expect(partitionForKey('hello', fnvMod)).toBe(0x4f9f2cab)
+  })
+
   it('is stable and maps the same key to the same partition', () => {
     const n = 8
     const a = partitionForKey('user-42', n)
@@ -144,6 +150,9 @@ describe('ConsumerGroup', () => {
 
   it('rebalances on join and leave, continuing from the group commit', () => {
     const topic = new PartitionedTopic<string>(2)
+    expect(partitionForKey('p0-only', 2)).toBe(0)
+    expect(partitionForKey('other', 2)).toBe(1)
+
     const group = new ConsumerGroup<string>(topic)
     const seen: string[] = []
     const hold: LogRecord<string>[] = []
@@ -155,22 +164,48 @@ describe('ConsumerGroup', () => {
 
     topic.produce('p0-only', 'a')
     expect(seen).toEqual(['1:a'])
-    expect(group.committedOffset(hold[0]!.partition)).toBe(1)
+    expect(hold[0]!.partition).toBe(0)
+    expect(group.committedOffset(0)).toBe(1)
+    expect(group.committedOffset(1)).toBe(0)
 
     const secondSeen: string[] = []
     const second = group.join((r) => secondSeen.push(r.payload))
-    expect(first.assignment().length + second.assignment().length).toBe(2)
-    expect(new Set([...first.assignment(), ...second.assignment()]).size).toBe(2)
+    expect(first.assignment()).toEqual([0])
+    expect(second.assignment()).toEqual([1])
 
     first.leave()
     expect(group.memberCount()).toBe(1)
     expect(second.assignment()).toEqual([0, 1])
+    expect(group.committedOffset(0)).toBe(1)
 
     topic.produce('p0-only', 'b')
     topic.produce('other', 'c')
-    expect(secondSeen).toContain('b')
-    expect(secondSeen).toContain('c')
+    expect(secondSeen.sort()).toEqual(['b', 'c'])
+    expect(secondSeen).not.toContain('a')
     expect(seen).toEqual(['1:a'])
+  })
+
+  it('keeps committed offsets after the last member leaves', () => {
+    const topic = new PartitionedTopic<string>(2)
+    expect(partitionForKey('p0-only', 2)).toBe(0)
+
+    const group = new ConsumerGroup<string>(topic)
+    const firstSeen: string[] = []
+    const first = group.join((r) => firstSeen.push(r.payload))
+    topic.produce('p0-only', 'first')
+    expect(firstSeen).toEqual(['first'])
+    expect(group.committedOffset(0)).toBe(1)
+
+    first.leave()
+    expect(group.memberCount()).toBe(0)
+    expect(group.committedOffset(0)).toBe(1)
+
+    topic.produce('p0-only', 'second')
+    const later: string[] = []
+    group.join((r) => later.push(r.payload))
+    expect(later).toEqual(['second'])
+    expect(later).not.toContain('first')
+    expect(group.committedOffset(0)).toBe(2)
   })
 
   it('catches up a late joiner from offset zero', () => {
@@ -199,6 +234,24 @@ describe('ConsumerGroup', () => {
     topic.produce('k', 'two')
     expect(seen).toEqual(['one', 'two'])
     expect(group.committedOffset(0)).toBe(2)
+  })
+
+  it('stalls only the throwing partition and still drains the rest', () => {
+    const topic = new PartitionedTopic<string>(2)
+    expect(partitionForKey('p0-only', 2)).toBe(0)
+    expect(partitionForKey('other', 2)).toBe(1)
+
+    const group = new ConsumerGroup<string>(topic)
+    const seen: string[] = []
+    group.join((r) => {
+      if (r.partition === 0) throw new Error('boom')
+      seen.push(r.payload)
+    })
+    topic.produce('p0-only', 'bad')
+    topic.produce('other', 'ok')
+    expect(seen).toEqual(['ok'])
+    expect(group.committedOffset(0)).toBe(0)
+    expect(group.committedOffset(1)).toBe(1)
   })
 
   it('keeps per-key order on the member that owns the partition', () => {

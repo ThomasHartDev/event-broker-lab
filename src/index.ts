@@ -47,3 +47,13 @@ export type {
   QueueBounds,
   QueueBoundOptions,
 } from './backpressure.js'
+
+export { KeyedWorkQueue } from './keyed-queue.js'
+
+export type {
+  KeyedMessage,
+  KeyedDelivery,
+  KeyedHandler,
+  KeyedWorkQueueOptions,
+  Unsubscribe as KeyedUnsubscribe,
+} from './keyed-queue.js'

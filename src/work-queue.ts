@@ -1,15 +1,4 @@
-import {
-  QueueFullError,
-  WatermarkGate,
-  resolveQueueBounds,
-  type BackpressureEvent,
-  type BackpressureListener,
-  type FlowState,
-  type QueueBoundOptions,
-} from './backpressure.js'
-
-export { QueueFullError } from './backpressure.js'
-export type { BackpressureEvent, BackpressureListener, FlowState } from './backpressure.js'
+import { RetryBackoff, systemClock, type BackoffOptions, type RetryClock } from './retry-backoff.js'
 
 export interface WorkMessage<T> {
   readonly id: number
@@ -27,16 +16,22 @@ export interface Delivery<T> {
 export type ConsumerHandler<T> = (delivery: Delivery<T>) => void
 export type Unsubscribe = () => void
 
-export type EnqueueResult = { readonly accepted: true; readonly id: number } | { readonly accepted: false }
-
-export interface WorkQueueOptions extends QueueBoundOptions {
+export interface WorkQueueOptions {
   maxDeliveryCount?: number
+  retryBackoff?: BackoffOptions | false
+  clock?: RetryClock
 }
 
 interface PendingMessage<T> {
   id: number
   payload: T
   deliveryCount: number
+  lastRetryDelayMs: number
+}
+
+interface DelayedRetry<T> {
+  pending: PendingMessage<T>
+  availableAt: number
 }
 
 interface InFlightEntry<T> {
@@ -56,15 +51,14 @@ interface ConsumerState<T> {
 const DEFAULT_MAX_DELIVERY_COUNT = 10
 
 export class WorkQueue<T> {
-  readonly capacity: number
-  readonly highWatermark: number
-  readonly lowWatermark: number
   private readonly ready: PendingMessage<T>[] = []
+  private readonly delayed: DelayedRetry<T>[] = []
   private readonly consumers: ConsumerState<T>[] = []
   private readonly inFlight = new Map<number, InFlightEntry<T>>()
-  private readonly listeners = new Set<BackpressureListener>()
-  private readonly gate: WatermarkGate | undefined
   private readonly maxDeliveryCount: number
+  private readonly backoff: RetryBackoff | null
+  private readonly clock: RetryClock
+  private cancelRetryTimer: (() => void) | undefined
   private nextMessageId = 1
   private nextDeliveryTag = 1
   private nextConsumerId = 1
@@ -77,43 +71,15 @@ export class WorkQueue<T> {
       throw new Error(`maxDeliveryCount must be a positive integer, got ${max}`)
     }
     this.maxDeliveryCount = max
-    const bounds = resolveQueueBounds(options)
-    this.capacity = bounds.capacity
-    this.highWatermark = bounds.highWatermark
-    this.lowWatermark = bounds.lowWatermark
-    this.gate =
-      bounds.capacity === Number.POSITIVE_INFINITY
-        ? undefined
-        : new WatermarkGate(bounds.highWatermark, bounds.lowWatermark)
+    this.backoff = options?.retryBackoff === false ? null : new RetryBackoff(options?.retryBackoff)
+    this.clock = options?.clock ?? systemClock()
   }
 
   enqueue(payload: T): number {
-    const result = this.tryEnqueue(payload)
-    if (!result.accepted) throw new QueueFullError(this.capacity)
-    return result.id
-  }
-
-  tryEnqueue(payload: T): EnqueueResult {
-    if (this.ready.length >= this.capacity) return { accepted: false }
     const id = this.nextMessageId++
-    this.ready.push({ id, payload, deliveryCount: 0 })
+    this.ready.push({ id, payload, deliveryCount: 0, lastRetryDelayMs: 0 })
     this.pump()
-    this.applyFlow()
-    return { accepted: true, id }
-  }
-
-  backpressure(): FlowState {
-    return this.gate?.state ?? 'open'
-  }
-
-  onBackpressure(listener: BackpressureListener): Unsubscribe {
-    this.listeners.add(listener)
-    let active = true
-    return () => {
-      if (!active) return
-      active = false
-      this.listeners.delete(listener)
-    }
+    return id
   }
 
   consume(handler: ConsumerHandler<T>, options?: { prefetch?: number }): Unsubscribe {
@@ -131,7 +97,6 @@ export class WorkQueue<T> {
     }
     this.consumers.push(consumer)
     this.pump()
-    this.applyFlow()
 
     return () => {
       if (!consumer.active) return
@@ -150,12 +115,24 @@ export class WorkQueue<T> {
       const i = this.consumers.indexOf(consumer)
       if (i !== -1) this.consumers.splice(i, 1)
       this.pump()
-      this.applyFlow()
     }
   }
 
   readyCount(): number {
     return this.ready.length
+  }
+
+  delayedCount(): number {
+    return this.delayed.length
+  }
+
+  nextRetryAt(): number | undefined {
+    if (this.delayed.length === 0) return undefined
+    let soonest = this.delayed[0]!.availableAt
+    for (const item of this.delayed) {
+      if (item.availableAt < soonest) soonest = item.availableAt
+    }
+    return soonest
   }
 
   inFlightCount(): number {
@@ -177,8 +154,9 @@ export class WorkQueue<T> {
     if (this.pumping) return
     this.pumping = true
     try {
-      // Cursor RR. Same id at most once per round so a sync nack cannot busy-spin.
+      this.releaseDueRetries()
       while (this.ready.length > 0 && this.hasConsumerCapacity()) {
+        // Same id at most once per round: a sync nack cannot busy-spin enqueue.
         const deliveredThisRound = new Set<number>()
         let deliveredAny = false
 
@@ -216,6 +194,7 @@ export class WorkQueue<T> {
     } finally {
       this.pumping = false
     }
+    this.armRetryTimer()
   }
 
   private deliver(consumer: ConsumerState<T>, pending: PendingMessage<T>): void {
@@ -243,7 +222,6 @@ export class WorkQueue<T> {
     try {
       consumer.handler(delivery)
     } catch {
-      // Throw ≡ nack({ requeue: true }) so uncaught handler errors do not strand work.
       if (!entry.settled) this.settle(deliveryTag, true)
     }
   }
@@ -257,31 +235,47 @@ export class WorkQueue<T> {
     const consumer = this.consumers.find((c) => c.id === entry.consumerId)
     if (consumer?.active) consumer.inFlight -= 1
 
-    // Tail, not head: a poison nack must not starve work already on ready.
     if (requeue && entry.pending.deliveryCount < this.maxDeliveryCount) {
-      this.ready.push(entry.pending)
+      this.scheduleRetry(entry.pending)
     }
     this.pump()
-    this.applyFlow()
   }
 
-  private applyFlow(): void {
-    if (this.pumping || !this.gate) return
-    const next = this.gate.observe(this.ready.length)
-    if (next === undefined) return
-    this.emit({ state: next, occupancy: this.ready.length, capacity: this.capacity })
-  }
-
-  private emit(event: BackpressureEvent): void {
-    const snapshot = [...this.listeners]
-    let firstError: unknown
-    for (const listener of snapshot) {
-      try {
-        listener(event)
-      } catch (error) {
-        if (firstError === undefined) firstError = error
-      }
+  private scheduleRetry(pending: PendingMessage<T>): void {
+    if (!this.backoff) {
+      this.ready.push(pending)
+      return
     }
-    if (firstError !== undefined) throw firstError
+    const delay = this.backoff.delayMs(pending.deliveryCount, pending.lastRetryDelayMs)
+    pending.lastRetryDelayMs = delay
+    if (delay === 0) {
+      this.ready.push(pending)
+      return
+    }
+    this.delayed.push({ pending, availableAt: this.clock.now() + delay })
+  }
+
+  private releaseDueRetries(): void {
+    if (this.delayed.length === 0) return
+    const now = this.clock.now()
+    const still: DelayedRetry<T>[] = []
+    for (const item of this.delayed) {
+      if (item.availableAt <= now) this.ready.push(item.pending)
+      else still.push(item)
+    }
+    this.delayed.length = 0
+    this.delayed.push(...still)
+  }
+
+  private armRetryTimer(): void {
+    this.cancelRetryTimer?.()
+    this.cancelRetryTimer = undefined
+    const soonest = this.nextRetryAt()
+    if (soonest === undefined) return
+    const wait = Math.max(0, soonest - this.clock.now())
+    this.cancelRetryTimer = this.clock.schedule(() => {
+      this.cancelRetryTimer = undefined
+      this.pump()
+    }, wait)
   }
 }

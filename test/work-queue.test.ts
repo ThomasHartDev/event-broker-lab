@@ -301,6 +301,30 @@ describe('consumer lifecycle', () => {
 })
 
 describe('exponential backoff on retry', () => {
+  it('enables RetryBackoff when retryBackoff is omitted', () => {
+    const restore = Math.random
+    Math.random = () => 0.5
+    const clock = new ManualClock()
+    let queue: WorkQueue<string>
+    try {
+      queue = new WorkQueue<string>({ clock })
+    } finally {
+      Math.random = restore
+    }
+    const counts: number[] = []
+    queue.consume((d) => {
+      counts.push(d.message.deliveryCount)
+      if (d.message.deliveryCount === 1) d.nack()
+      else d.ack()
+    })
+    queue.enqueue('job')
+    expect(counts).toEqual([1])
+    expect(queue.delayedCount()).toBe(1)
+    clock.advance(100)
+    expect(counts).toEqual([1, 2])
+    expect(queue.delayedCount()).toBe(0)
+  })
+
   it('holds a nack until the exponential delay elapses', () => {
     const clock = new ManualClock()
     const queue = new WorkQueue<string>({
@@ -412,6 +436,28 @@ describe('exponential backoff on retry', () => {
     expect(seen).toEqual(['recover'])
     clock.advance(25)
     expect(seen).toEqual(['recover', 'recover'])
+  })
+
+  it('threads lastRetryDelayMs through decorrelated retries', () => {
+    const clock = new ManualClock()
+    const queue = new WorkQueue<string>({
+      clock,
+      retryBackoff: { jitter: 'decorrelated', random: () => 0.5 },
+    })
+    const counts: number[] = []
+    queue.consume((d) => {
+      counts.push(d.message.deliveryCount)
+      if (d.message.deliveryCount < 3) d.nack()
+      else d.ack()
+    })
+    queue.enqueue('job')
+    expect(counts).toEqual([1])
+    expect(queue.nextRetryAt()).toBe(200)
+    clock.advance(200)
+    expect(counts).toEqual([1, 2])
+    expect(queue.nextRetryAt()).toBe(550)
+    clock.advance(350)
+    expect(counts).toEqual([1, 2, 3])
   })
 
   it('keeps delayed retries when the holding consumer unsubscribes', () => {

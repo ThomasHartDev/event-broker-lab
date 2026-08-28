@@ -21,10 +21,17 @@ export interface WriteAheadLogOptions {
   readonly sync?: () => void
 }
 
+function crc32LengthAndPayload(length: number, payload: Uint8Array): number {
+  const body = Buffer.allocUnsafe(4 + payload.byteLength)
+  body.writeUInt32LE(length, 0)
+  Buffer.from(payload).copy(body, 4)
+  return crc32(body)
+}
+
 function frame(payload: Uint8Array): Buffer {
   const out = Buffer.allocUnsafe(8 + payload.byteLength)
   out.writeUInt32LE(payload.byteLength, 0)
-  out.writeUInt32LE(crc32(payload), 4)
+  out.writeUInt32LE(crc32LengthAndPayload(payload.byteLength, payload), 4)
   Buffer.from(payload).copy(out, 8)
   return out
 }
@@ -40,12 +47,34 @@ function parse(buf: Buffer): { payloads: Buffer[]; consumed: number } {
     const end = start + length
     if (length > MAX_PAYLOAD || end > buf.length) break
     const payload = buf.subarray(start, end)
-    // First bad record is a torn or corrupt tail. Nothing after it is trusted.
-    if (crc32(payload) !== expected) break
+    // First bad CRC or incomplete header is a torn tail. Nothing after it is trusted.
+    if (crc32LengthAndPayload(length, payload) !== expected) break
     payloads.push(Buffer.from(payload))
     offset = end
   }
   return { payloads, consumed: offset }
+}
+
+function writeFully(fd: number, bytes: Buffer, position: number): number {
+  let offset = 0
+  while (offset < bytes.length) {
+    const n = fs.writeSync(fd, bytes, offset, bytes.length - offset, position + offset)
+    if (n <= 0) throw new Error('short write')
+    offset += n
+  }
+  return offset
+}
+
+function readFully(fd: number, size: number): Buffer {
+  if (size <= 0) return Buffer.alloc(0)
+  const buf = Buffer.allocUnsafe(size)
+  let offset = 0
+  while (offset < size) {
+    const n = fs.readSync(fd, buf, offset, size - offset, offset)
+    if (n <= 0) return buf.subarray(0, offset)
+    offset += n
+  }
+  return buf
 }
 
 export class WriteAheadLog {
@@ -126,9 +155,7 @@ export class WriteAheadLog {
 
   private readAll(): Buffer {
     if (this.fd === undefined) return this.mem
-    const buf = Buffer.alloc(this.size)
-    if (this.size > 0) fs.readSync(this.fd, buf, 0, this.size, 0)
-    return buf
+    return readFully(this.fd, this.size)
   }
 
   private write(bytes: Buffer): void {
@@ -136,8 +163,13 @@ export class WriteAheadLog {
       this.mem = Buffer.concat([this.mem, bytes])
       return
     }
-    fs.writeSync(this.fd, bytes, 0, bytes.length, this.size)
-    this.size += bytes.length
+    let offset = 0
+    while (offset < bytes.length) {
+      const n = fs.writeSync(this.fd, bytes, offset, bytes.length - offset, this.size)
+      if (n <= 0) throw new Error('short write')
+      this.size += n
+      offset += n
+    }
   }
 
   private replace(bytes: Buffer): void {
@@ -148,7 +180,7 @@ export class WriteAheadLog {
     const tmp = `${this.path}.tmp`
     const tfd = fs.openSync(tmp, 'w')
     try {
-      fs.writeSync(tfd, bytes, 0, bytes.length, 0)
+      writeFully(tfd, bytes, 0)
       fs.fsyncSync(tfd)
     } finally {
       fs.closeSync(tfd)

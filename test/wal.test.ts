@@ -2,7 +2,7 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
-import { crc32, DurableWorkQueue, WriteAheadLog } from '../src/index.js'
+import { crc32, DurableWorkQueue, WriteAheadLog, type Delivery } from '../src/index.js'
 
 const enc = (s: string) => Buffer.from(s)
 const payloads = (log: WriteAheadLog) => [...log.replay()].map((b) => Buffer.from(b).toString())
@@ -30,6 +30,7 @@ function drain<T>(q: DurableWorkQueue<T>): T[] {
 describe('WriteAheadLog', () => {
   it('checksums, fsyncs on append, and preserves order including empty payloads', () => {
     expect(crc32(new Uint8Array())).toBe(0)
+    expect(crc32(Buffer.alloc(4))).not.toBe(0)
     expect(crc32(enc('123456789'))).toBe(0xcbf43926)
     let syncs = 0
     const log = WriteAheadLog.memory({ sync: () => { syncs += 1 } })
@@ -89,6 +90,59 @@ describe('WriteAheadLog', () => {
     const reopened = WriteAheadLog.open(compacted)
     cleanups.push(() => reopened.close())
     expect(payloads(reopened)).toEqual(['b', 'c'])
+  })
+
+  it('truncates an eight-byte zero tail and keeps only real payloads', () => {
+    const file = tmpFile()
+    const log = WriteAheadLog.open(file)
+    log.append(enc('one'))
+    log.append(enc('two'))
+    log.close()
+    const size = fs.statSync(file).size
+    fs.appendFileSync(file, Buffer.alloc(8))
+    const reopened = WriteAheadLog.open(file)
+    cleanups.push(() => reopened.close())
+    expect(payloads(reopened)).toEqual(['one', 'two'])
+    expect(fs.statSync(file).size).toBe(size)
+  })
+
+  it('does not replay a well-formed record after an eight-byte zero hole', () => {
+    const prefix = tmpFile()
+    const first = WriteAheadLog.open(prefix)
+    first.append(enc('one'))
+    first.close()
+    const prefixSize = fs.statSync(prefix).size
+
+    const full = tmpFile()
+    const second = WriteAheadLog.open(full)
+    second.append(enc('one'))
+    second.append(enc('sneak'))
+    second.close()
+    const sneak = fs.readFileSync(full).subarray(prefixSize)
+
+    const file = tmpFile()
+    fs.copyFileSync(prefix, file)
+    fs.appendFileSync(file, Buffer.alloc(8))
+    fs.appendFileSync(file, sneak)
+    const reopened = WriteAheadLog.open(file)
+    cleanups.push(() => reopened.close())
+    expect(payloads(reopened)).toEqual(['one'])
+    expect(fs.statSync(file).size).toBe(prefixSize)
+  })
+
+  it('keeps a record appended after torn-tail recovery across reopen', () => {
+    const file = tmpFile()
+    const log = WriteAheadLog.open(file)
+    log.append(enc('one'))
+    log.append(enc('two'))
+    log.close()
+    fs.appendFileSync(file, Buffer.from([8, 0, 0, 0, 1, 2, 3]))
+    const recovered = WriteAheadLog.open(file)
+    recovered.append(enc('three'))
+    recovered.close()
+    const reopened = WriteAheadLog.open(file)
+    cleanups.push(() => reopened.close())
+    expect(payloads(reopened)).toEqual(['one', 'two', 'three'])
   })
 })
 
@@ -153,5 +207,51 @@ describe('DurableWorkQueue crash recovery', () => {
     const recovered = DurableWorkQueue.open<{ job: string }>(file)
     cleanups.push(() => recovered.close())
     expect(drain(recovered).map((m) => m.job)).toEqual(['b'])
+  })
+
+  it('redelivers a prefix enqueue when the log tail is eight zeros', () => {
+    const file = tmpFile()
+    const q = DurableWorkQueue.open<string>(file)
+    q.enqueue('keep-me')
+    q.close()
+    fs.appendFileSync(file, Buffer.alloc(8))
+    const recovered = DurableWorkQueue.open<string>(file)
+    cleanups.push(() => recovered.close())
+    expect(drain(recovered)).toEqual(['keep-me'])
+  })
+
+  it('stale ack after unsubscribe does not drop requeued work from the log', () => {
+    const file = tmpFile()
+    const q = DurableWorkQueue.open<string>(file)
+    let stolen: Delivery<string> | undefined
+    const off = q.consume((d) => {
+      stolen = d
+    })
+    q.enqueue('held')
+    off()
+    expect(q.readyCount()).toBe(1)
+    stolen!.ack()
+    expect(q.readyCount()).toBe(1)
+    q.close()
+    const recovered = DurableWorkQueue.open<string>(file)
+    cleanups.push(() => recovered.close())
+    expect(drain(recovered)).toEqual(['held'])
+  })
+
+  it('stale drop-nack after unsubscribe does not drop requeued work from the log', () => {
+    const file = tmpFile()
+    const q = DurableWorkQueue.open<string>(file)
+    let stolen: Delivery<string> | undefined
+    const off = q.consume((d) => {
+      stolen = d
+    })
+    q.enqueue('held')
+    off()
+    stolen!.nack({ requeue: false })
+    expect(q.readyCount()).toBe(1)
+    q.close()
+    const recovered = DurableWorkQueue.open<string>(file)
+    cleanups.push(() => recovered.close())
+    expect(drain(recovered)).toEqual(['held'])
   })
 })

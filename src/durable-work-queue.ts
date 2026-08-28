@@ -88,14 +88,24 @@ export class DurableWorkQueue<T> {
   }
 
   consume(handler: ConsumerHandler<T>, options?: { prefetch?: number }): Unsubscribe {
-    return this.inner.consume((delivery) => {
-      const wrapped = this.wrap(delivery)
+    const inflight = new Set<{ settled: boolean }>()
+    const off = this.inner.consume((delivery) => {
+      const gate = { settled: false }
+      inflight.add(gate)
+      const wrapped = this.wrap(delivery, gate)
       try {
         handler(wrapped)
       } catch {
         wrapped.nack()
+      } finally {
+        if (gate.settled) inflight.delete(gate)
       }
     }, options)
+    return () => {
+      for (const gate of inflight) gate.settled = true
+      inflight.clear()
+      off()
+    }
   }
 
   checkpoint(): void {
@@ -112,8 +122,13 @@ export class DurableWorkQueue<T> {
     return this.inner.readyCount()
   }
 
-  private wrap(delivery: Delivery<Inner<T>>): Delivery<T> {
+  private wrap(delivery: Delivery<Inner<T>>, gate: { settled: boolean }): Delivery<T> {
     const walId = delivery.message.payload.walId
+    const finish = (fn: () => void) => {
+      if (gate.settled) return
+      gate.settled = true
+      fn()
+    }
     return {
       message: {
         id: walId,
@@ -121,16 +136,18 @@ export class DurableWorkQueue<T> {
         deliveryCount: delivery.message.deliveryCount,
       },
       deliveryTag: delivery.deliveryTag,
-      ack: () => {
-        this.commit('ack', walId)
-        delivery.ack()
-      },
-      nack: (opts) => {
-        if (opts?.requeue === false || delivery.message.deliveryCount >= this.maxDeliveryCount) {
-          this.commit('drop', walId)
-        }
-        delivery.nack(opts)
-      },
+      ack: () =>
+        finish(() => {
+          this.commit('ack', walId)
+          delivery.ack()
+        }),
+      nack: (opts) =>
+        finish(() => {
+          if (opts?.requeue === false || delivery.message.deliveryCount >= this.maxDeliveryCount) {
+            this.commit('drop', walId)
+          }
+          delivery.nack(opts)
+        }),
     }
   }
 

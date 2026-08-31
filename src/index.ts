@@ -69,3 +69,10 @@ export { DurableWorkQueue } from './durable-work-queue.js'
 export type {
   DurableWorkQueueOptions,
 } from './durable-work-queue.js'
+
+export { TopicMetrics, DEFAULT_CONSUMER } from './metrics.js'
+
+export type {
+  TopicSnapshot,
+  TopicMetricsOptions,
+} from './metrics.js'

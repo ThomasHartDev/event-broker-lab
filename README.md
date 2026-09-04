@@ -19,6 +19,9 @@ Message brokers hide a lot of machinery behind `publish` and `subscribe`. This r
 - **Redelivery counting**, **bounded redelivery** (`maxDeliveryCount`, default 10; excess drops), and **tail requeue** on nack so other ready work is not starved
 - **Dead-letter queue** for poison messages after a bounded number of failed attempts
 
+- **Bounded buffers** with a finite ready-queue `capacity` and **reject-on-full** (`QueueFullError` / `tryEnqueue`)
+- **High/low watermark backpressure** (hysteresis / Schmitt trigger) so producers pause before the wall and resume after the queue drains, without flapping in the band
+- **Producer-facing occupancy**: capacity is ready depth. Prefetch already caps in-flight. Redelivery of accepted work is allowed to sit above capacity so a nack cannot drop a message the queue already took.
 ## What's implemented
 
 - **Topic-based publish/subscribe with fan-out.** A `Broker` where subscribers register handlers against a topic and every publish fans out to all matching subscribers, with monotonic message ids, idempotent unsubscribe, and snapshot-consistent delivery (subscribing or unsubscribing during dispatch never changes who receives the in-flight message).
@@ -27,6 +30,10 @@ Message brokers hide a lot of machinery behind `publish` and `subscribe`. This r
 - **Dead-letter queue for poison messages.** A `DeadLetterQueue` that counts attempts per original message (and optional subscription), parks a failed payload once `maxAttempts` is exhausted, and supports peek, drop, purge, and redrive back onto a publisher.
 - **At-least-once delivery with redelivery on nack.** A `ReliableBroker` where publish still fans out, but each subscriber owns a private inbox. `ack` settles that copy. `nack` (or a handler throw) redelivers it to the same subscriber with `deliveryCount` incremented and `redelivered` set. Peers who already acked are not retried. `nack({ requeue: false })` drops only that subscriber's copy. Retries stop at `maxDeliveryCount`. Optional per-subscriber prefetch isolates a slow consumer without stalling everyone else.
 
+- **Bounded buffers** with a finite ready-queue `capacity` and **reject-on-full** (`QueueFullError` / `tryEnqueue`)
+- **High/low watermark backpressure** (hysteresis / Schmitt trigger) so producers pause before the wall and resume after the queue drains, without flapping in the band
+- **Producer-facing occupancy**: capacity is ready depth. Prefetch already caps in-flight. Redelivery of accepted work is allowed to sit above capacity so a nack cannot drop a message the queue already took.
+- **Bounded queues with backpressure signaling.** Give `WorkQueue` a finite `capacity`. New publishes that would grow the ready backlog past that bound are rejected (`enqueue` throws `QueueFullError`, `tryEnqueue` returns `{ accepted: false }`). A `WatermarkGate` watches ready depth: occupancy at or above `highWatermark` emits `paused`, occupancy at or below `lowWatermark` emits `open`, and values in between hold the last state. Subscribe with `onBackpressure` or poll `backpressure()`. Defaults: high equals capacity, low is half the capacity (or `high - 1` when high is small). Unbounded queues stay the default so existing callers do not change.
 ## Usage
 
 ```ts

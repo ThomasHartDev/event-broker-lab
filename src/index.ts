@@ -1,22 +1,38 @@
 export { Broker } from './broker.js'
-export type { Message, Handler, Unsubscribe } from './broker.js'
+
+export type {
+  Message,
+  Handler,
+  Unsubscribe,
+} from './broker.js'
+
 export { matchTopic, isValidTopic, isValidPattern } from './topic-match.js'
+
 export { DeadLetterQueue, DeadLetterFullError, withDeadLetter } from './dead-letter.js'
+
 export type {
   DeadLetterEnvelope,
   DeadLetterQueueOptions,
   FailResult,
   FailStatus,
 } from './dead-letter.js'
-export { WorkQueue } from './work-queue.js'
+
+export { WorkQueue, QueueFullError } from './work-queue.js'
+
 export type {
   WorkMessage,
   Delivery,
   ConsumerHandler,
   WorkQueueOptions,
   Unsubscribe as WorkQueueUnsubscribe,
+  EnqueueResult,
+  BackpressureEvent,
+  BackpressureListener,
+  FlowState,
 } from './work-queue.js'
+
 export { ReliableBroker } from './reliable-broker.js'
+
 export type {
   ReliableMessage,
   ReliableDelivery,
@@ -24,3 +40,10 @@ export type {
   ReliableBrokerOptions,
   ReliableSubscribeOptions,
 } from './reliable-broker.js'
+
+export { WatermarkGate, resolveQueueBounds } from './backpressure.js'
+
+export type {
+  QueueBounds,
+  QueueBoundOptions,
+} from './backpressure.js'

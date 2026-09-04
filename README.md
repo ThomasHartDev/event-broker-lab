@@ -28,6 +28,10 @@ Message brokers hide a lot of machinery behind `publish` and `subscribe`. This r
 - **Torn-write recovery**: a truncated or checksum-mismatched tail is dropped, not replayed
 - **Crash recovery by replay**: enqueue / ack / drop records rebuild the ready set
 - **Log truncation (checkpoint)**: rewrite the file to live enqueue records so the log cannot grow without bound
+- **Consumer lag** as `logEndOffset - committedOffset`, tracked per topic and per consumer
+- **Time lag** as the age of the oldest unconsumed produce
+- **Sliding-window throughput** (circular time buckets) for produce and consume rates, so a quiet period after a burst reports ~0
+
 ## What's implemented
 
 - **Topic-based publish/subscribe with fan-out.** A `Broker` where subscribers register handlers against a topic and every publish fans out to all matching subscribers, with monotonic message ids, idempotent unsubscribe, and snapshot-consistent delivery (subscribing or unsubscribing during dispatch never changes who receives the in-flight message).
@@ -47,6 +51,10 @@ Message brokers hide a lot of machinery behind `publish` and `subscribe`. This r
 - **Crash recovery by replay**: enqueue / ack / drop records rebuild the ready set
 - **Log truncation (checkpoint)**: rewrite the file to live enqueue records so the log cannot grow without bound
 - **Write-ahead log for crash durability.** A `WriteAheadLog` stores length-prefixed records (`u32le` length, `u32le` CRC32, payload) and fsyncs before `append` returns. On open it replays complete records and truncates a torn or corrupt tail. `DurableWorkQueue` logs enqueue, ack, and drop *before* the in-memory mutation, so a restart redelivers unacked work and does not resurrect acked work. `checkpoint()` rewrites the file to the live enqueue records (temp file, fsync, atomic rename).
+- **Consumer lag** as `logEndOffset - committedOffset`, tracked per topic and per consumer
+- **Time lag** as the age of the oldest unconsumed produce
+- **Sliding-window throughput** (circular time buckets) for produce and consume rates, so a quiet period after a burst reports ~0
+- **Throughput and lag metrics per topic.** `TopicMetrics` records `produced` / `consumed` per topic. Lag is `logEndOffset - committedOffset` (Kafka's formula), time lag is the age of the oldest unconsumed record, and produce/consume rates use a sliding window of circular time buckets. Two consumers on one topic keep independent commits and rates.
 ## Usage
 
 ```ts

@@ -59,7 +59,7 @@ export class DurableWorkQueue<T> {
     if (!Number.isInteger(maxDeliveryCount) || maxDeliveryCount < 1) {
       throw new Error(`maxDeliveryCount must be a positive integer, got ${maxDeliveryCount}`)
     }
-    const inner = new WorkQueue<Inner<T>>({ maxDeliveryCount })
+    const inner = new WorkQueue<Inner<T>>({ maxDeliveryCount, retryBackoff: false })
     const live = new Map<number, T>()
     let nextId = 1
     try {

@@ -3,7 +3,7 @@ import { QueueFullError, WorkQueue, type BackpressureEvent, type Delivery } from
 
 describe('WorkQueue bounded ready backlog', () => {
   it('throws QueueFullError once ready depth hits capacity', () => {
-    const queue = new WorkQueue<string>({ capacity: 2 })
+    const queue = new WorkQueue<string>({ retryBackoff: false, capacity: 2 })
     expect(queue.enqueue('a')).toBe(1)
     expect(queue.enqueue('b')).toBe(2)
     expect(queue.readyCount()).toBe(2)
@@ -14,7 +14,7 @@ describe('WorkQueue bounded ready backlog', () => {
   })
 
   it('does not spend a message id on a rejected enqueue', () => {
-    const queue = new WorkQueue<string>({ capacity: 1 })
+    const queue = new WorkQueue<string>({ retryBackoff: false, capacity: 1 })
     expect(queue.enqueue('held')).toBe(1)
     expect(queue.tryEnqueue('nope')).toEqual({ accepted: false })
     const seen: number[] = []
@@ -27,7 +27,7 @@ describe('WorkQueue bounded ready backlog', () => {
   })
 
   it('accepts again after consumers drain below capacity', () => {
-    const queue = new WorkQueue<number>({ capacity: 1 })
+    const queue = new WorkQueue<number>({ retryBackoff: false, capacity: 1 })
     queue.enqueue(1)
     expect(queue.tryEnqueue(2).accepted).toBe(false)
     const seen: number[] = []
@@ -41,7 +41,7 @@ describe('WorkQueue bounded ready backlog', () => {
   })
 
   it('counts only ready depth, not in-flight deliveries', () => {
-    const queue = new WorkQueue<string>({ capacity: 1 })
+    const queue = new WorkQueue<string>({ retryBackoff: false, capacity: 1 })
     const held: Delivery<string>[] = []
     queue.consume((d) => held.push(d))
     expect(queue.enqueue('in-flight')).toBe(1)
@@ -56,7 +56,7 @@ describe('WorkQueue bounded ready backlog', () => {
   })
 
   it('lets redelivery exceed capacity so accepted work is not dropped', () => {
-    const queue = new WorkQueue<string>({ capacity: 1 })
+    const queue = new WorkQueue<string>({ retryBackoff: false, capacity: 1 })
     const held: Delivery<string>[] = []
     const off = queue.consume((d) => held.push(d), { prefetch: 2 })
     queue.enqueue('a')
@@ -73,7 +73,7 @@ describe('WorkQueue bounded ready backlog', () => {
 
 describe('WorkQueue backpressure signaling', () => {
   it('stays open when a consumer drains as fast as we enqueue', () => {
-    const queue = new WorkQueue<string>({ capacity: 2, highWatermark: 2, lowWatermark: 1 })
+    const queue = new WorkQueue<string>({ retryBackoff: false, capacity: 2, highWatermark: 2, lowWatermark: 1 })
     const events: BackpressureEvent[] = []
     queue.onBackpressure((event) => events.push(event))
     queue.consume((d) => d.ack())
@@ -85,7 +85,7 @@ describe('WorkQueue backpressure signaling', () => {
   })
 
   it('pauses at high watermark and resumes at or below low, without flapping in the band', () => {
-    const queue = new WorkQueue<string>({ capacity: 4, highWatermark: 3, lowWatermark: 1 })
+    const queue = new WorkQueue<string>({ retryBackoff: false, capacity: 4, highWatermark: 3, lowWatermark: 1 })
     const events: Pick<BackpressureEvent, 'state' | 'occupancy'>[] = []
     queue.onBackpressure((event) => events.push({ state: event.state, occupancy: event.occupancy }))
 
@@ -120,7 +120,7 @@ describe('WorkQueue backpressure signaling', () => {
   })
 
   it('unsubscribing a listener stops further events', () => {
-    const queue = new WorkQueue<string>({ capacity: 2 })
+    const queue = new WorkQueue<string>({ retryBackoff: false, capacity: 2 })
     const seen: string[] = []
     const off = queue.onBackpressure((event) => seen.push(event.state))
     queue.enqueue('a')
@@ -136,7 +136,7 @@ describe('WorkQueue backpressure signaling', () => {
   })
 
   it('delivers the first listener error after the rest of the snapshot runs', () => {
-    const queue = new WorkQueue<string>({ capacity: 1 })
+    const queue = new WorkQueue<string>({ retryBackoff: false, capacity: 1 })
     const order: string[] = []
     queue.onBackpressure(() => {
       order.push('a')
@@ -152,7 +152,7 @@ describe('WorkQueue backpressure signaling', () => {
   })
 
   it('surfaces a listener error when consume drains a paused queue with sync ack', () => {
-    const queue = new WorkQueue<string>({ capacity: 4, highWatermark: 3, lowWatermark: 1 })
+    const queue = new WorkQueue<string>({ retryBackoff: false, capacity: 4, highWatermark: 3, lowWatermark: 1 })
     queue.enqueue('1')
     queue.enqueue('2')
     queue.enqueue('3')
@@ -178,7 +178,7 @@ describe('WorkQueue backpressure signaling', () => {
   })
 
   it('does not reject a nack requeue when ready is already at capacity', () => {
-    const queue = new WorkQueue<string>({ capacity: 1 })
+    const queue = new WorkQueue<string>({ retryBackoff: false, capacity: 1 })
     const events: string[] = []
     queue.onBackpressure((event) => events.push(event.state))
     let first: Delivery<string> | undefined

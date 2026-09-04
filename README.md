@@ -22,6 +22,8 @@ Message brokers hide a lot of machinery behind `publish` and `subscribe`. This r
 - **Bounded buffers** with a finite ready-queue `capacity` and **reject-on-full** (`QueueFullError` / `tryEnqueue`)
 - **High/low watermark backpressure** (hysteresis / Schmitt trigger) so producers pause before the wall and resume after the queue drains, without flapping in the band
 - **Producer-facing occupancy**: capacity is ready depth. Prefetch already caps in-flight. Redelivery of accepted work is allowed to sit above capacity so a nack cannot drop a message the queue already took.
+- **Per-key FIFO ordering**: at most one in-flight delivery per key (SQS FIFO message group / Kafka key), a partial order across keys, and head-of-line blocking only within a key
+
 ## What's implemented
 
 - **Topic-based publish/subscribe with fan-out.** A `Broker` where subscribers register handlers against a topic and every publish fans out to all matching subscribers, with monotonic message ids, idempotent unsubscribe, and snapshot-consistent delivery (subscribing or unsubscribing during dispatch never changes who receives the in-flight message).
@@ -34,6 +36,8 @@ Message brokers hide a lot of machinery behind `publish` and `subscribe`. This r
 - **High/low watermark backpressure** (hysteresis / Schmitt trigger) so producers pause before the wall and resume after the queue drains, without flapping in the band
 - **Producer-facing occupancy**: capacity is ready depth. Prefetch already caps in-flight. Redelivery of accepted work is allowed to sit above capacity so a nack cannot drop a message the queue already took.
 - **Bounded queues with backpressure signaling.** Give `WorkQueue` a finite `capacity`. New publishes that would grow the ready backlog past that bound are rejected (`enqueue` throws `QueueFullError`, `tryEnqueue` returns `{ accepted: false }`). A `WatermarkGate` watches ready depth: occupancy at or above `highWatermark` emits `paused`, occupancy at or below `lowWatermark` emits `open`, and values in between hold the last state. Subscribe with `onBackpressure` or poll `backpressure()`. Defaults: high equals capacity, low is half the capacity (or `high - 1` when high is small). Unbounded queues stay the default so existing callers do not change.
+- **Per-key FIFO ordering**: at most one in-flight delivery per key (SQS FIFO message group / Kafka key), a partial order across keys, and head-of-line blocking only within a key
+- **Per-key ordering guarantees.** A `KeyedWorkQueue` where each message carries a group key. The head of a key is exclusive: the tail stays queued until that head is acked, nacked-and-dropped, or cancelled. Different keys can be in flight on competing consumers at the same time. A nack requeues at the head of that key so a later message of the same key cannot overtake. Prefetch can hold several keys, never two messages of one key.
 ## Usage
 
 ```ts

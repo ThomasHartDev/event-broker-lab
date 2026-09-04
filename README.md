@@ -35,6 +35,10 @@ Message brokers hide a lot of machinery behind `publish` and `subscribe`. This r
 - **Partitioned log** with **key-based partitioning** (FNV-1a) so a key is sticky to one partition
 - **Consumer groups** with **range** and **round-robin partition assignment**, **eager rebalance** on join/leave, and **group-level committed offsets**
 - **Per-key ordering**: records for one key append in order on one partition, and only the assigned member reads them
+- **Exponential backoff** on retry: `min(cap, base * 2^(attempt-1))`
+- **Jitter** (full, equal, decorrelated) so concurrent retries do not align
+- **Delayed retry queue** with an injectable clock, so tests can advance time without sleeping
+
 ## What's implemented
 
 - **Topic-based publish/subscribe with fan-out.** A `Broker` where subscribers register handlers against a topic and every publish fans out to all matching subscribers, with monotonic message ids, idempotent unsubscribe, and snapshot-consistent delivery (subscribing or unsubscribing during dispatch never changes who receives the in-flight message).
@@ -65,6 +69,10 @@ Message brokers hide a lot of machinery behind `publish` and `subscribe`. This r
 - **Consumer groups** with **range** and **round-robin partition assignment**, **eager rebalance** on join/leave, and **group-level committed offsets**
 - **Per-key ordering**: records for one key append in order on one partition, and only the assigned member reads them
 - **Consumer groups with partition assignment.** A `PartitionedTopic` is an append-only log split into N partitions. `produce(key, payload)` hashes the key with FNV-1a so that key always lands on the same partition. A `ConsumerGroup` assigns each partition to at most one member using Kafka's range assignor (consecutive slices, remainder on the first members) or round-robin (interleaved). Independent groups each see the full log. Offsets are stored on the group, so a rebalance hands a partition to a peer at the last committed offset instead of replaying from zero. A thrown handler stalls that partition until the next pump.
+- **Exponential backoff** on retry: `min(cap, base * 2^(attempt-1))`
+- **Jitter** (full, equal, decorrelated) so concurrent retries do not align
+- **Delayed retry queue** with an injectable clock, so tests can advance time without sleeping
+- **Exponential backoff with jitter on retry.** A nack or handler throw no longer redelivers in the same tick by default. The wait is exponential, then jittered (`full` by default, also `equal` and `decorrelated`). Ready work is not blocked behind a delayed retry. Pass `retryBackoff: false` for immediate requeue.
 ## Usage
 
 ```ts

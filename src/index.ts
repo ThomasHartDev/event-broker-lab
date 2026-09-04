@@ -91,3 +91,11 @@ export type {
   RecordHandler,
   GroupMember,
 } from './consumer-group.js'
+
+export { RetryBackoff, ManualClock, systemClock } from './retry-backoff.js'
+
+export type {
+  JitterStrategy,
+  RetryClock,
+  BackoffOptions,
+} from './retry-backoff.js'

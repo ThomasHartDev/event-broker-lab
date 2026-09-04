@@ -7,6 +7,7 @@ import {
   type FlowState,
   type QueueBoundOptions,
 } from './backpressure.js'
+import { RetryBackoff, systemClock, type BackoffOptions, type RetryClock } from './retry-backoff.js'
 
 export { QueueFullError } from './backpressure.js'
 export type { BackpressureEvent, BackpressureListener, FlowState } from './backpressure.js'
@@ -31,12 +32,20 @@ export type EnqueueResult = { readonly accepted: true; readonly id: number } | {
 
 export interface WorkQueueOptions extends QueueBoundOptions {
   maxDeliveryCount?: number
+  retryBackoff?: BackoffOptions | false
+  clock?: RetryClock
 }
 
 interface PendingMessage<T> {
   id: number
   payload: T
   deliveryCount: number
+  lastRetryDelayMs: number
+}
+
+interface DelayedRetry<T> {
+  pending: PendingMessage<T>
+  availableAt: number
 }
 
 interface InFlightEntry<T> {
@@ -65,6 +74,10 @@ export class WorkQueue<T> {
   private readonly listeners = new Set<BackpressureListener>()
   private readonly gate: WatermarkGate | undefined
   private readonly maxDeliveryCount: number
+  private readonly delayed: DelayedRetry<T>[] = []
+  private readonly backoff: RetryBackoff | null
+  private readonly clock: RetryClock
+  private cancelRetryTimer: (() => void) | undefined
   private nextMessageId = 1
   private nextDeliveryTag = 1
   private nextConsumerId = 1
@@ -85,6 +98,8 @@ export class WorkQueue<T> {
       bounds.capacity === Number.POSITIVE_INFINITY
         ? undefined
         : new WatermarkGate(bounds.highWatermark, bounds.lowWatermark)
+    this.backoff = options?.retryBackoff === false ? null : new RetryBackoff(options?.retryBackoff)
+    this.clock = options?.clock ?? systemClock()
   }
 
   enqueue(payload: T): number {
@@ -96,7 +111,7 @@ export class WorkQueue<T> {
   tryEnqueue(payload: T): EnqueueResult {
     if (this.ready.length >= this.capacity) return { accepted: false }
     const id = this.nextMessageId++
-    this.ready.push({ id, payload, deliveryCount: 0 })
+    this.ready.push({ id, payload, deliveryCount: 0, lastRetryDelayMs: 0 })
     this.pump()
     this.applyFlow()
     return { accepted: true, id }
@@ -158,6 +173,19 @@ export class WorkQueue<T> {
     return this.ready.length
   }
 
+  delayedCount(): number {
+    return this.delayed.length
+  }
+
+  nextRetryAt(): number | undefined {
+    if (this.delayed.length === 0) return undefined
+    let soonest = this.delayed[0]!.availableAt
+    for (const item of this.delayed) {
+      if (item.availableAt < soonest) soonest = item.availableAt
+    }
+    return soonest
+  }
+
   inFlightCount(): number {
     return this.inFlight.size
   }
@@ -177,6 +205,7 @@ export class WorkQueue<T> {
     if (this.pumping) return
     this.pumping = true
     try {
+      this.releaseDueRetries()
       // Cursor RR. Same id at most once per round so a sync nack cannot busy-spin.
       while (this.ready.length > 0 && this.hasConsumerCapacity()) {
         const deliveredThisRound = new Set<number>()
@@ -216,6 +245,7 @@ export class WorkQueue<T> {
     } finally {
       this.pumping = false
     }
+    this.armRetryTimer()
   }
 
   private deliver(consumer: ConsumerState<T>, pending: PendingMessage<T>): void {
@@ -259,10 +289,48 @@ export class WorkQueue<T> {
 
     // Tail, not head: a poison nack must not starve work already on ready.
     if (requeue && entry.pending.deliveryCount < this.maxDeliveryCount) {
-      this.ready.push(entry.pending)
+      this.scheduleRetry(entry.pending)
     }
     this.pump()
     this.applyFlow()
+  }
+
+  private scheduleRetry(pending: PendingMessage<T>): void {
+    if (!this.backoff) {
+      this.ready.push(pending)
+      return
+    }
+    const delay = this.backoff.delayMs(pending.deliveryCount, pending.lastRetryDelayMs)
+    pending.lastRetryDelayMs = delay
+    if (delay === 0) {
+      this.ready.push(pending)
+      return
+    }
+    this.delayed.push({ pending, availableAt: this.clock.now() + delay })
+  }
+
+  private releaseDueRetries(): void {
+    if (this.delayed.length === 0) return
+    const now = this.clock.now()
+    const still: DelayedRetry<T>[] = []
+    for (const item of this.delayed) {
+      if (item.availableAt <= now) this.ready.push(item.pending)
+      else still.push(item)
+    }
+    this.delayed.length = 0
+    this.delayed.push(...still)
+  }
+
+  private armRetryTimer(): void {
+    this.cancelRetryTimer?.()
+    this.cancelRetryTimer = undefined
+    const soonest = this.nextRetryAt()
+    if (soonest === undefined) return
+    const wait = Math.max(0, soonest - this.clock.now())
+    this.cancelRetryTimer = this.clock.schedule(() => {
+      this.cancelRetryTimer = undefined
+      this.pump()
+    }, wait)
   }
 
   private applyFlow(): void {

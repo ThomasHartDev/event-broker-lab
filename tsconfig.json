@@ -8,7 +8,7 @@
     "noImplicitOverride": true,
     "esModuleInterop": true,
     "skipLibCheck": true,
-    "types": ["vitest/globals"],
+    "types": ["vitest/globals", "node"],
     "outDir": "dist",
     "declaration": true
   },

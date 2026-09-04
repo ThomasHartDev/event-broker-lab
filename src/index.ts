@@ -57,3 +57,15 @@ export type {
   KeyedWorkQueueOptions,
   Unsubscribe as KeyedUnsubscribe,
 } from './keyed-queue.js'
+
+export { WriteAheadLog, crc32 } from './wal.js'
+
+export type {
+  WriteAheadLogOptions,
+} from './wal.js'
+
+export { DurableWorkQueue } from './durable-work-queue.js'
+
+export type {
+  DurableWorkQueueOptions,
+} from './durable-work-queue.js'
